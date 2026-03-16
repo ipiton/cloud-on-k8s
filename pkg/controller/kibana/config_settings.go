@@ -18,6 +18,7 @@ import (
 
 	commonv1 "github.com/elastic/cloud-on-k8s/v3/pkg/apis/common/v1"
 	kbv1 "github.com/elastic/cloud-on-k8s/v3/pkg/apis/kibana/v1"
+	"github.com/elastic/cloud-on-k8s/v3/pkg/controller/agent"
 	"github.com/elastic/cloud-on-k8s/v3/pkg/controller/association"
 	"github.com/elastic/cloud-on-k8s/v3/pkg/controller/common/certificates"
 	commonpassword "github.com/elastic/cloud-on-k8s/v3/pkg/controller/common/password"
@@ -175,6 +176,12 @@ func NewConfigSettings(ctx context.Context, client k8s.Client, kb kbv1.Kibana, v
 	// Kibana settings from a StackConfigPolicy takes precedence over user provided settings, merge them last.
 	if err = cfg.MergeWith(userSettings, kibanaConfigFromPolicy); err != nil {
 		return CanonicalConfig{}, err
+	}
+
+	if esAssocConf.ClientCertIsConfigured() {
+		if err := injectFleetOutputClientCerts(cfg, esAssocConf.GetURL()); err != nil {
+			return CanonicalConfig{}, err
+		}
 	}
 
 	return CanonicalConfig{cfg}, nil
@@ -400,4 +407,61 @@ func packageRegistrySettings(kb kbv1.Kibana) map[string]any {
 		cfg[XpackFleetRegistryURL] = assocConf.GetURL()
 	}
 	return cfg
+}
+
+// agentESClientCertDir is the mount path for client certificates inside fleet-managed Agent pods.
+var agentESClientCertDir = agent.FleetManagedAgentClientCertDir
+
+// injectFleetOutputClientCerts post-processes the merged Kibana config to inject
+// ssl.certificate and ssl.key into any xpack.fleet.outputs entry that is of type
+// "elasticsearch" and whose hosts list contains the given esURL. User-provided
+// values are preserved (not overwritten).
+func injectFleetOutputClientCerts(cfg *settings.CanonicalConfig, esURL string) error {
+	ucfgCfg := (*ucfg.Config)(cfg)
+	opts := settings.Options
+
+	for i := 0; ; i++ {
+		output, childErr := ucfgCfg.Child("xpack.fleet.outputs", i, opts...)
+		if childErr != nil {
+			// childErr signals end of indexed children, not a real error
+			break
+		}
+
+		outputType, err := output.String("type", -1, opts...)
+		if err != nil || outputType != "elasticsearch" {
+			continue
+		}
+
+		if !outputHostsContain(output, esURL) {
+			continue
+		}
+
+		if has, _ := output.Has("ssl.certificate", -1, opts...); !has {
+			if err := output.SetString("ssl.certificate", -1, path.Join(agentESClientCertDir, certificates.CertFileName), opts...); err != nil {
+				return err
+			}
+		}
+		if has, _ := output.Has("ssl.key", -1, opts...); !has {
+			if err := output.SetString("ssl.key", -1, path.Join(agentESClientCertDir, certificates.KeyFileName), opts...); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil //nolint:nilerr
+}
+
+func outputHostsContain(output *ucfg.Config, url string) bool {
+	opts := settings.Options
+	numHosts, err := output.CountField("hosts", opts...)
+	if err != nil {
+		return false
+	}
+	for i := range numHosts {
+		host, err := output.String("hosts", i, opts...)
+		if err == nil && host == url {
+			return true
+		}
+	}
+	return false
 }

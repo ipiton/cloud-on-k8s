@@ -146,6 +146,11 @@ func buildOutputConfig(params Params) (*settings.CanonicalConfig, error) {
 		if assocConf.GetCACertProvided() {
 			output["ssl.certificate_authorities"] = []string{path.Join(certificatesDir(assoc), CAFileName)}
 		}
+		if assocConf.ClientCertIsConfigured() {
+			clientCertDir := standaloneAgentClientCertificatesDir(assoc)
+			output["ssl.certificate"] = path.Join(clientCertDir, certificates.CertFileName)
+			output["ssl.key"] = path.Join(clientCertDir, certificates.KeyFileName)
+		}
 
 		outputName := params.Agent.Spec.ElasticsearchRefs[i].OutputName
 		if outputName == "" {
